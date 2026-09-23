@@ -165,6 +165,24 @@ class TestAnalyse(unittest.TestCase):
             self.assertTrue(all(z[0] > price for z in a["res"]))
             self.assertTrue(all(z[0] < price for z in a["sup"]))
 
+    def test_weekly_levels_used_as_resistance(self):
+        # vieux sommet hebdo à 120 000 que la fenêtre jour (180 j) ne voit pas
+        weekly = candles_from_closes([80000 + 1000 * i for i in range(40)]
+                                     + [120000] + [100000 - 1000 * i for i in range(40)],
+                                     spread=0, step=7 * 86400)
+        daily = candles_from_closes(trend(60000, 0.002, 300, wiggle=0.02))
+        a = bs.analyse(daily, weekly)
+        self.assertTrue(any(abs(z[0] - 120000) < 1 for z in a["res"]), a["res"])
+
+    def test_overextended_uptrend_waits_for_pullback(self):
+        closes = trend(40000, 0.002, 400, wiggle=0.01)
+        closes += [closes[-1] * 1.03 ** i for i in range(1, 8)]   # envolée de 7 jours
+        daily = candles_from_closes(closes, spread=0.003)
+        a = bs.analyse(daily, to_weekly(daily))
+        self.assertGreater(a["stretch"], 2)
+        self.assertIn("REPLI", a["verdict"])
+        self.assertLess(a["plan"]["entry"], a["price"])
+
     def test_short_history_does_not_crash(self):
         daily = candles_from_closes(trend(50000, 0.001, 60, wiggle=0.02))
         weekly = candles_from_closes(trend(50000, 0.001, 10, wiggle=0.02), step=7 * 86400)

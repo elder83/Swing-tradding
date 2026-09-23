@@ -220,7 +220,7 @@ def analyse(daily, weekly):
         else:
             add(-1, "EMA50 < EMA200 jour (death cross en place)")
         add(1 if price > last(d["ema200"]) else -1,
-            f"Prix {'au-dessus' if price > last(d['ema200']) else 'sous'} l'EMA200 jour")
+            f"Prix {'au-dessus de' if price > last(d['ema200']) else 'sous'} l'EMA200 jour")
 
     # --- Momentum / timing (jour)
     h, hp = last(d["macd_hist"]), last(d["macd_hist"], 1)
@@ -250,13 +250,19 @@ def analyse(daily, weekly):
         add(1, "Clôture sous la bande de Bollinger basse (excès baissier)")
 
     # --- Supports / résistances
+    # pivots jour (6 mois) + pivots hebdo (2 ans) pour voir les niveaux plus anciens
     highs, lows = pivots(daily)
-    zones = cluster(highs + lows)
+    w_highs, w_lows = pivots(weekly, 2, 2, 104)
+    zones = cluster(highs + lows + w_highs + w_lows)
     res = sorted([z for z in zones if z[0] > price * 1.005], key=lambda z: z[0])[:3]
     sup = sorted([z for z in zones if z[0] < price * 0.995], key=lambda z: -z[0])[:3]
 
     a = last(d["atr"])
-    if score >= 4:
+    stretch = (price - last(d["ema20"])) / a if last(d["ema20"]) else 0
+    if score >= 4 and stretch > 2:
+        verdict = (f"ACHAT SUR REPLI (tendance haussière mais prix étiré à {stretch:.1f} ATR "
+                   "au-dessus de l'EMA20 : ne pas acheter au plus haut)")
+    elif score >= 4:
         verdict = "ACHAT (tendance + momentum alignés)"
     elif score >= 2:
         verdict = "ACHAT SUR REPLI (attendre un retour vers un support / l'EMA20)"
@@ -268,13 +274,13 @@ def analyse(daily, weekly):
         verdict = "ATTENTE (signaux contradictoires)"
 
     pullback = max(last(d["ema20"]) or 0, sup[0][0] if sup else price - a)
-    entry = price if score >= 4 else min(price, pullback)
+    entry = price if score >= 4 and stretch <= 2 else min(price, pullback)
     plan = dict(entry=entry, stop=entry - 2 * a, t1=entry + 2 * a, t2=entry + 4 * a)
     if res:
         plan["t1"] = min(plan["t1"], res[0][0]) if res[0][0] > entry else plan["t1"]
 
     return dict(price=price, score=score, verdict=verdict, notes=notes, res=res, sup=sup,
-                plan=plan, atr=a, d=d, w=w, rsi_w=last(w["rsi"]),
+                plan=plan, atr=a, stretch=stretch, d=d, w=w, rsi_w=last(w["rsi"]),
                 date=datetime.fromtimestamp(daily[-1]["t"], timezone.utc))
 
 

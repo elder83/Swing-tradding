@@ -25,6 +25,13 @@ from datetime import datetime, timezone
 # Données
 # --------------------------------------------------------------------------
 
+class DataError(RuntimeError):
+    """Aucune source de données n'a répondu."""
+
+
+INTERVAL_S = {"1d": 86400, "1w": 7 * 86400}
+
+
 def _get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "btc-swing/1.0"})
     with urllib.request.urlopen(req, timeout=20) as r:
@@ -34,9 +41,11 @@ def _get_json(url):
 def fetch_binance(interval, limit):
     url = ("https://api.binance.com/api/v3/klines?symbol=BTCUSDT"
            f"&interval={interval}&limit={limit}")
-    rows = _get_json(url)
+    now_ms = time.time() * 1000
+    # r[6] = heure de clôture : on écarte la bougie en cours (non clôturée)
     return [dict(t=int(r[0]) // 1000, o=float(r[1]), h=float(r[2]),
-                 l=float(r[3]), c=float(r[4]), v=float(r[5])) for r in rows]
+                 l=float(r[3]), c=float(r[4]), v=float(r[5]))
+            for r in _get_json(url) if int(r[6]) < now_ms]
 
 
 def fetch_kraken(interval, limit):
@@ -45,18 +54,20 @@ def fetch_kraken(interval, limit):
     if data.get("error"):
         raise RuntimeError(data["error"])
     rows = next(v for k, v in data["result"].items() if k != "last")
+    now = time.time()
     return [dict(t=int(r[0]), o=float(r[1]), h=float(r[2]), l=float(r[3]),
-                 c=float(r[4]), v=float(r[6])) for r in rows][-limit:]
+                 c=float(r[4]), v=float(r[6]))
+            for r in rows if int(r[0]) + INTERVAL_S[interval] <= now][-limit:]
 
 
 def fetch(interval, limit):
     errors = []
-    for src in (fetch_binance, fetch_kraken):
+    for name in ("binance", "kraken"):
         try:
-            return src(interval, limit), src.__name__.replace("fetch_", "")
+            return globals()[f"fetch_{name}"](interval, limit), name
         except Exception as e:  # noqa: BLE001 - on essaie la source suivante
-            errors.append(f"{src.__name__}: {e}")
-    raise SystemExit("Impossible de récupérer les données :\n  " + "\n  ".join(errors))
+            errors.append(f"{name}: {e}")
+    raise DataError("Impossible de récupérer les données :\n  " + "\n  ".join(errors))
 
 
 def demo_candles(n, step_days, seed):
@@ -142,10 +153,11 @@ def pivots(c, left=5, right=5, lookback=180):
     c = c[-lookback:]
     highs, lows = [], []
     for i in range(left, len(c) - right):
-        window = c[i - left:i + right + 1]
-        if c[i]["h"] == max(x["h"] for x in window):
+        before, after = c[i - left:i], c[i + 1:i + right + 1]
+        # strict à gauche, large à droite : un sommet égal n'est compté qu'une fois
+        if c[i]["h"] > max(x["h"] for x in before) and c[i]["h"] >= max(x["h"] for x in after):
             highs.append(c[i]["h"])
-        if c[i]["l"] == min(x["l"] for x in window):
+        if c[i]["l"] < min(x["l"] for x in before) and c[i]["l"] <= min(x["l"] for x in after):
             lows.append(c[i]["l"])
     return highs, lows
 
@@ -188,6 +200,7 @@ def analyse(daily, weekly):
         notes.append(f"{pts:+d}  {txt}")
 
     # --- Tendance de fond (hebdo) : elle décide du sens privilégié
+    bull = last(w["sma50"]) is None or price > last(w["sma50"])
     if last(w["sma50"]) and price > last(w["sma50"]):
         add(2, "Prix au-dessus de la MM50 hebdo (tendance de fond haussière)")
     elif last(w["sma50"]):
@@ -220,14 +233,16 @@ def analyse(daily, weekly):
             add(1 if h > hp else -1, f"Momentum MACD jour {'en hausse' if h > hp else 'en baisse'}")
 
     r = last(d["rsi"])
+    # Les signaux contrariants valent moins quand ils vont contre la tendance de fond
     if r >= 75:
-        add(-2, f"RSI jour {r:.0f} : fort surachat, risque de correction")
+        add(-2 if not bull else -1, f"RSI jour {r:.0f} : fort surachat, risque de correction")
     elif r >= 65:
         add(-1, f"RSI jour {r:.0f} : zone haute, ne pas courir après le prix")
     elif r <= 30:
-        add(2, f"RSI jour {r:.0f} : survente, rebond probable")
-    elif r <= 40:
-        add(1, f"RSI jour {r:.0f} : zone basse, intéressant pour accumuler")
+        add(2 if bull else 1, f"RSI jour {r:.0f} : survente, rebond "
+            + ("probable" if bull else "technique possible (contre-tendance)"))
+    elif r <= 40 and bull:
+        add(1, f"RSI jour {r:.0f} : zone basse dans une tendance haussière, bon point d'accumulation")
 
     if last(d["bb_up"]) and price > last(d["bb_up"]):
         add(-1, "Clôture au-dessus de la bande de Bollinger haute (extension)")
@@ -252,7 +267,8 @@ def analyse(daily, weekly):
     else:
         verdict = "ATTENTE (signaux contradictoires)"
 
-    entry = price if score >= 4 else max(last(d["ema20"]), sup[0][0] if sup else price - a)
+    pullback = max(last(d["ema20"]) or 0, sup[0][0] if sup else price - a)
+    entry = price if score >= 4 else min(price, pullback)
     plan = dict(entry=entry, stop=entry - 2 * a, t1=entry + 2 * a, t2=entry + 4 * a)
     if res:
         plan["t1"] = min(plan["t1"], res[0][0]) if res[0][0] > entry else plan["t1"]
@@ -263,6 +279,8 @@ def analyse(daily, weekly):
 
 
 def fmt(x):
+    if x is None:
+        return "       n/d  "
     return f"{x:>10,.0f} $".replace(",", " ")
 
 
@@ -283,7 +301,8 @@ def report(a, source):
         f"  EMA21  hebdo        {fmt(last(w['ema21']))}   {pct(last(w['ema21']))}",
         f"  MM50   hebdo        {fmt(last(w['sma50']))}   {pct(last(w['sma50']))}",
         "",
-        f" RSI14 jour {last(d['rsi']):.1f}   |   RSI14 hebdo {a['rsi_w']:.1f}",
+        f" RSI14 jour {last(d['rsi']):.1f}   |   RSI14 hebdo "
+        + (f"{a['rsi_w']:.1f}" if a["rsi_w"] is not None else "n/d"),
         "",
         " Résistances : " + ", ".join(f"{z[0]:,.0f} ({z[1]}x)".replace(",", " ") for z in a["res"]),
         " Supports    : " + ", ".join(f"{z[0]:,.0f} ({z[1]}x)".replace(",", " ") for z in a["sup"]),
@@ -322,10 +341,20 @@ def main():
     ap.add_argument("--demo", action="store_true", help="données synthétiques (hors ligne)")
     args = ap.parse_args()
     while True:
-        run(args.demo)
+        try:
+            run(args.demo)
+        except DataError as e:
+            if not args.watch:
+                raise SystemExit(str(e))
+            print(f"[{datetime.now():%Y-%m-%d %H:%M}] {e}\nNouvel essai dans {args.watch} h.")
+        except KeyboardInterrupt:
+            break
         if not args.watch:
             break
-        time.sleep(args.watch * 3600)
+        try:
+            time.sleep(args.watch * 3600)
+        except KeyboardInterrupt:
+            break
 
 
 if __name__ == "__main__":

@@ -18,6 +18,16 @@ python3 btc_swing.py --demo     # test hors ligne avec données synthétiques
 
 Aucune dépendance : Python 3.8+ suffit.
 
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+20 tests hors ligne : indicateurs comparés à des valeurs de référence (RSI de Wilder),
+lecture des réponses Binance/Kraken simulées, bascule d'une source à l'autre,
+cohérence des signaux et du plan de trade, cas limites.
+
 ## Logique du score
 
 1. **Tendance de fond (hebdo)** : on n'achète en priorité que si le prix est au-dessus de la MM50 et de l'EMA21 hebdo.

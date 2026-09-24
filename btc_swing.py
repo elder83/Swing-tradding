@@ -6,7 +6,8 @@ indicateurs classiques et produit un signal ACHAT / VENTE / ATTENTE avec
 niveaux d'entrée, stop et objectifs basés sur l'ATR.
 
 Usage :
-    python3 btc_swing.py              # analyse ponctuelle
+    python3 btc_swing.py --hebdo      # swing hebdo (à lancer le lundi matin)
+    python3 btc_swing.py              # analyse jour (timing plus fin)
     python3 btc_swing.py --watch 4    # relance toutes les 4 heures
     python3 btc_swing.py --demo       # données synthétiques (test hors ligne)
 
@@ -68,6 +69,28 @@ def fetch(interval, limit):
         except Exception as e:  # noqa: BLE001 - on essaie la source suivante
             errors.append(f"{name}: {e}")
     raise DataError("Impossible de récupérer les données :\n  " + "\n  ".join(errors))
+
+
+def eur_rate():
+    """Taux USD -> EUR déduit des paires BTC/EUR et BTC/USD de Kraken (None si indisponible)."""
+    try:
+        res = _get_json("https://api.kraken.com/0/public/Ticker?pair=XBTEUR,XBTUSD")["result"]
+        eur = next(float(v["c"][0]) for k, v in res.items() if k.endswith("EUR"))
+        usd = next(float(v["c"][0]) for k, v in res.items() if k.endswith("USD"))
+        return eur / usd
+    except Exception:  # noqa: BLE001 - l'affichage en euros est un bonus
+        return None
+
+
+def weeks_from_daily(daily):
+    """Semaines lundi -> dimanche (UTC), seulement les semaines complètes."""
+    groups = {}
+    for x in daily:
+        monday = x["t"] - datetime.fromtimestamp(x["t"], timezone.utc).weekday() * 86400
+        groups.setdefault(monday - monday % 86400, []).append(x)
+    return [dict(t=k, o=v[0]["o"], h=max(i["h"] for i in v), l=min(i["l"] for i in v),
+                 c=v[-1]["c"], v=sum(i["v"] for i in v))
+            for k, v in sorted(groups.items()) if len(v) == 7]
 
 
 def demo_candles(n, step_days, seed):
@@ -284,6 +307,88 @@ def analyse(daily, weekly):
                 date=datetime.fromtimestamp(daily[-1]["t"], timezone.utc))
 
 
+def analyse_weekly(weekly, price=None):
+    """Swing hebdo : la tendance hebdo décide, les niveaux hebdo donnent entrées et sorties.
+
+    Règle de fond (testée sur 2015-2026) : on n'est acheteur que si la semaine clôture
+    au-dessus de la MM50 hebdo ; sous la bande EMA21/MM20 hebdo, on sort.
+    """
+    c = [x["c"] for x in weekly]
+    close = c[-1]
+    price = price or close
+    ema21, sma20, sma50 = last(ema(c, 21)), last(sma(c, 20)), last(sma(c, 50))
+    r = last(rsi(c))
+    hist = macd(c)[2]
+    a = last(atr(weekly))
+    band_lo, band_hi = min(ema21, sma20), max(ema21, sma20)
+
+    highs, lows = pivots(weekly, 2, 2, 156)
+    zones = cluster(highs + lows)
+    res = sorted([z for z in zones if z[0] > price * 1.01], key=lambda z: z[0])[:3]
+    sup = sorted([z for z in zones if z[0] < price * 0.99], key=lambda z: -z[0])[:3]
+
+    above50 = sma50 is not None and close > sma50
+    if close < band_lo:
+        regime, action = "BAISSIER", "HORS DU MARCHÉ : garder la part trading en USDC"
+    elif not above50:
+        regime, action = "NEUTRE", "PRUDENCE : pas de nouvel achat tant que la MM50 hebdo n'est pas reprise"
+    elif r is not None and r >= 70:
+        regime, action = "HAUSSIER (surchauffe)", "ALLÉGER : prendre une partie des gains"
+    else:
+        regime, action = "HAUSSIER", "ACHETEUR : acheter les replis, conserver les positions"
+
+    zone_buy = max([z[0] for z in sup] + [sma50 or 0, band_hi])
+    zone_buy = min(zone_buy, price)
+    plan = dict(buy=zone_buy, t1=res[0][0] if res else price + a,
+                t2=res[1][0] if len(res) > 1 else price + 2 * a,
+                reduce=sma50, exit=band_lo)
+    return dict(close=close, price=price, ema21=ema21, sma20=sma20, sma50=sma50, rsi=r,
+                hist=last(hist), hist_prev=last(hist, 1), atr=a, res=res, sup=sup,
+                regime=regime, action=action, plan=plan,
+                date=datetime.fromtimestamp(weekly[-1]["t"] + 6 * 86400, timezone.utc))
+
+
+def report_weekly(a, source, rate=None):
+    def m(x):
+        if x is None:
+            return "n/d"
+        usd = f"{x:,.0f} $".replace(",", " ")
+        return usd + (f"  ({x * rate:,.0f} €)".replace(",", " ") if rate else "")
+
+    momentum = "en hausse" if a["hist"] > a["hist_prev"] else "en baisse"
+    lines = [
+        "=" * 64,
+        f" BITCOIN – Swing HEBDO ({source}, semaine close le {a['date']:%Y-%m-%d})",
+        "=" * 64,
+        f" Prix actuel            {m(a['price'])}",
+        f" Clôture hebdo          {m(a['close'])}",
+        f" Mouvement moyen/semaine {m(a['atr'])}  ({a['atr'] / a['close'] * 100:.0f} %)",
+        "",
+        f" Bande EMA21/MM20 hebdo {m(min(a['ema21'], a['sma20']))} – {m(max(a['ema21'], a['sma20']))}",
+        f" MM50 hebdo             {m(a['sma50'])}",
+        f" RSI hebdo              {a['rsi']:.0f}",
+        f" MACD hebdo             {'positif' if a['hist'] > 0 else 'négatif'}, {momentum}",
+        "",
+        " Résistances : " + ", ".join(m(z[0]) for z in a["res"]),
+        " Supports    : " + ", ".join(m(z[0]) for z in a["sup"]),
+        "",
+        f" TENDANCE : {a['regime']}",
+        f" ACTION   : {a['action']}",
+        "",
+        " Ordres à placer pour la semaine :",
+        f"   Achat sur repli vers   {m(a['plan']['buy'])}",
+        f"   Vente partielle vers   {m(a['plan']['t1'])}",
+        f"   Vente partielle vers   {m(a['plan']['t2'])}",
+        f"   Clôture hebdo sous     {m(a['plan']['reduce'])}  → alléger de moitié",
+        f"   Clôture hebdo sous     {m(a['plan']['exit'])}  → tout repasser en USDC",
+        "",
+        " Décider uniquement sur la clôture du dimanche soir (lundi 2 h, heure de Paris).",
+        " Pas un conseil en investissement.",
+        "=" * 64,
+    ]
+    print("\n".join(lines))
+
+
 def fmt(x):
     if x is None:
         return "       n/d  "
@@ -332,7 +437,15 @@ def report(a, source):
     print("\n".join(lines))
 
 
-def run(demo):
+def run(demo, hebdo=False):
+    if hebdo:
+        if demo:
+            daily, src, price, rate = demo_candles(800, 1, 3), "démo", None, None
+        else:
+            daily, src = fetch("1d", 1000)
+            price, rate = daily[-1]["c"], eur_rate()
+        report_weekly(analyse_weekly(weeks_from_daily(daily), price), src, rate)
+        return
     if demo:
         daily, weekly, src = demo_candles(400, 1, 1), demo_candles(200, 7, 2), "démo"
     else:
@@ -344,11 +457,12 @@ def run(demo):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--watch", type=float, metavar="HEURES", help="relancer l'analyse toutes les N heures")
+    ap.add_argument("--hebdo", action="store_true", help="swing sur l'unité de temps semaine")
     ap.add_argument("--demo", action="store_true", help="données synthétiques (hors ligne)")
     args = ap.parse_args()
     while True:
         try:
-            run(args.demo)
+            run(args.demo, args.hebdo)
         except DataError as e:
             if not args.watch:
                 raise SystemExit(str(e))

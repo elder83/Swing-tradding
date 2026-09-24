@@ -193,6 +193,58 @@ class TestAnalyse(unittest.TestCase):
         self.assertIn("n/d", buf.getvalue())
 
 
+class TestWeekly(unittest.TestCase):
+    MONDAY = 1_704_067_200  # 2024-01-01 00:00 UTC, un lundi
+
+    def test_weeks_are_monday_based_and_complete(self):
+        # commence un mercredi, finit un mardi : seules les semaines pleines restent
+        daily = candles_from_closes(list(range(100, 130)), t0=self.MONDAY + 2 * 86400)
+        weeks = bs.weeks_from_daily(daily)
+        self.assertEqual(len(weeks), 3)
+        for w in weeks:
+            self.assertEqual((w["t"] - self.MONDAY) % (7 * 86400), 0)
+        first = daily[5:12]                      # lundi 8 -> dimanche 14 janvier
+        self.assertEqual(weeks[0]["o"], first[0]["o"])
+        self.assertEqual(weeks[0]["c"], first[-1]["c"])
+        self.assertEqual(weeks[0]["h"], max(x["h"] for x in first))
+
+    def _weekly(self, closes):
+        return candles_from_closes(closes, spread=0.02, step=7 * 86400, t0=self.MONDAY)
+
+    def test_regime_bullish(self):
+        a = bs.analyse_weekly(self._weekly(trend(20000, 0.01, 120, wiggle=0.05)))
+        self.assertTrue(a["regime"].startswith("HAUSSIER"))
+        self.assertLessEqual(a["plan"]["buy"], a["price"])
+        self.assertLess(a["plan"]["exit"], a["price"])
+
+    def test_regime_bearish(self):
+        a = bs.analyse_weekly(self._weekly(trend(100000, -0.01, 120, wiggle=0.05)))
+        self.assertEqual(a["regime"], "BAISSIER")
+        self.assertIn("USDC", a["action"])
+
+    def test_regime_neutral_between_band_and_ma50(self):
+        closes = trend(100000, -0.02, 100)
+        closes += [closes[-1] * 1.03 ** i for i in range(1, 11)]
+        a = bs.analyse_weekly(self._weekly(closes))
+        self.assertGreater(a["close"], min(a["ema21"], a["sma20"]))
+        self.assertLess(a["close"], a["sma50"])
+        self.assertEqual(a["regime"], "NEUTRE")
+
+    def test_eur_rate(self):
+        payload = {"result": {"XXBTZEUR": {"c": ["74000", "1"]}, "XXBTZUSD": {"c": ["84000", "1"]}}}
+        with mock.patch.object(bs, "_get_json", return_value=payload):
+            self.assertAlmostEqual(bs.eur_rate(), 74000 / 84000)
+        with mock.patch.object(bs, "_get_json", side_effect=OSError):
+            self.assertIsNone(bs.eur_rate())
+
+    def test_demo_hebdo_end_to_end(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf), mock.patch.object(sys, "argv", ["btc_swing.py", "--hebdo", "--demo"]):
+            bs.main()
+        for s in ("Swing HEBDO", "TENDANCE", "tout repasser en USDC"):
+            self.assertIn(s, buf.getvalue())
+
+
 class TestCli(unittest.TestCase):
     def test_demo_end_to_end(self):
         buf = io.StringIO()
@@ -205,7 +257,7 @@ class TestCli(unittest.TestCase):
     def test_watch_survives_network_error(self):
         calls = {"n": 0}
 
-        def fake_run(demo):
+        def fake_run(demo, hebdo=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise bs.DataError("réseau coupé")
